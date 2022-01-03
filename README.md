@@ -3,7 +3,10 @@ a uefi bootloader written in rust for a personal project
 
 
 ## What it does ##
-Loads a elf binary named "kernel" from the root directory of the efi partition and transfers control to it.
+Loads an elf binary named "kernel" from the root directory of the efi partition and transfers control to it.
+
+Passes reference to system table and memory map to entry point of kernel
+
 
 
 ## Building ##
@@ -15,4 +18,4 @@ cargo +nightly build  -Z build-std=core,compiler_builtins,alloc,panic_abort,std 
 ## To do ##
 
 *   Initialize GOP
-*   pass references to the system table and GOP to the kernel
+*   Pass GOP reference to kernel
