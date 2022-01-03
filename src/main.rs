@@ -8,7 +8,7 @@ mod uefi;
 use crate::uefi::*;
 use core::ffi::c_void;
 use core::fmt::Write;
-use core::mem::{transmute,size_of};
+use core::mem::transmute;
 use xmas_elf::ElfFile;
 
 #[no_mangle]
@@ -20,32 +20,31 @@ pub extern "efiapi" fn efi_main(_handle:Handle,system_table:*const SystemTable)-
     let kernel = match get_kernel_file(system_table){
         Ok(proto) => proto,
         Err(why) => {
-                write!(&mut writer,"Could not get kernel, error :{}\n\r",why);
-                return why;
+                write!(&mut writer,"Could not get kernel, error :{}\n\r",why).expect("write error");
+                loop{};
         }
     };
     let kernel_size =  match get_kernel_size(system_table,kernel){
         Ok(size)    => size,
         Err(why)    => {
-            write!(&mut writer,"Could not get kernel size, Error :{}\n\r",why);
-            return why;
+            write!(&mut writer,"Could not get kernel size, Error :{}\n\r",why).expect("write error");
+            loop{};
         }
     };
-    write!(writer,"kernel size: {}\n\r",kernel_size);
+    write!(writer,"kernel size: {}\n\r",kernel_size).expect("write error");
     //allocate memory for buffer
-    let mut status:&mut Status = &mut 7;
     let kernel_buffer_ptr = match allocate_pool(system_table,kernel_size){
         Ok(ptr)     => ptr,
         Err(why)    => {
-            write!(&mut writer,"Could not Allocate memory for kernel, Error :{}\n\r",why);
-            return why;
+            write!(&mut writer,"Could not Allocate memory for kernel, Error :{}\n\r",why).expect("write error");
+            loop{};
         }
     };
 
     let fill_kernel_buffer =get_kernel_buffer(kernel,&kernel_size,kernel_buffer_ptr);
     if fill_kernel_buffer !=0{
-        write!(&mut writer,"could not read kernel file, Error:{}",fill_kernel_buffer);
-        return 0;
+        write!(&mut writer,"could not read kernel file, Error:{}",fill_kernel_buffer).expect("write error");
+        loop{};
     }
     let kernel_buffer  = unsafe{core::slice::from_raw_parts(kernel_buffer_ptr,kernel_size)};
 
@@ -70,7 +69,6 @@ pub extern "efiapi" fn efi_main(_handle:Handle,system_table:*const SystemTable)-
         if p_type == xmas_elf::program::Type::Load{
 
             let mut address = p_header.physical_addr();
-            write!(&mut writer,"Address before:{:#0x}\n\r",address);
             let mut offset_mem:u64 = 0;
             //make the address 4096 aligned
             if address % 4096 !=0{
@@ -80,11 +78,11 @@ pub extern "efiapi" fn efi_main(_handle:Handle,system_table:*const SystemTable)-
             let status = allocate_pages(system_table,&address,1);
 
             if status !=0{
-                write!(&mut writer,"Address:{:#0x}, Error code:{:#0x}\n\r",address,status);
+                write!(&mut writer,"Address:{:#0x}, Error code:{:#0x}\n\r",address,status).expect("write error");
                 loop{}
             }
             //get a slice to the page we just allocated
-            let mut load_slice = unsafe{
+            let load_slice = unsafe{
                 core::slice::from_raw_parts_mut(
                     (address+offset_mem) as *mut u8, 
                     4096-offset_mem as usize)
@@ -112,19 +110,75 @@ pub extern "efiapi" fn efi_main(_handle:Handle,system_table:*const SystemTable)-
 
     }
     //get the entry point
-    let mut entry_point:u64 = kernel_elf.header.pt2.entry_point();
+    let entry_point:u64 = kernel_elf.header.pt2.entry_point();
     //convert address to function pointer
-    let exec_kernel: fn() -> i32 = unsafe{transmute(entry_point)};
+    let exec_kernel: fn(system_table:*const SystemTable,memory_map:(*const u8,usize,usize)) -> i32 = unsafe{transmute(entry_point)};
+
+    //get memory map
+    let mem_map = match get_memory_map(system_table, &mut writer){
+        Ok(mem_tuple)   => mem_tuple,
+        Err(why)        => {
+            write!(&mut writer,"failed to get memory map,Error: {:#0x}",why).expect("");
+            loop{}
+        }
+    };
+
 
     //run kernel
-    let return_val = exec_kernel();
-    write!(&mut writer,"kernel returned: {}",return_val);
+    let return_val = exec_kernel(system_table,mem_map);
+    write!(&mut writer,"kernel returned: {}",return_val).expect("write error");
     
     
     loop{}
     return 1;
 }
-fn allocate_pool(system_table:*const SystemTable,size:usize) ->Result<*const u8,Status>{
+fn get_memory_map(system_table:*const SystemTable,writer:&mut Writer) -> Result<(*const u8,usize,usize),Status>{
+    //fn(memory_map_size:*const  usize,memory_map:*const u8,map_key:*const usize,descriptor_size:*const usize,descriptor_version:*const usize) ->Status,
+    let mut memory_map_size:usize = 0;
+    //null pointer should not get accessed on the first call as memory map size is set to 0
+    let memory_map:*const u8 = unsafe{transmute(memory_map_size)};
+    let map_key:usize = 0;
+    let descriptor_size:usize = 0;
+    let descriptor_version:usize = 0;
+
+    //call get memory map once with size set to 0 so that it returns the required buffer size
+    unsafe{
+        let _status = ((*(*system_table).boot).get_memory_map)(
+                &memory_map_size,
+                memory_map,
+                &map_key,
+                &descriptor_size,
+                &descriptor_version
+        );
+    }
+    //increment to ensure we have enough space
+    memory_map_size+=1;
+    //allocate buffer for memory map
+    
+    let buffer = match allocate_pool::<u8>(system_table,memory_map_size) {
+            Ok(buff)    => buff,
+            Err(why)    => {
+                write!(writer,"Failed to allocate pool, Error :{:#0x}",why).expect("write error");
+                return Err(why);
+            }
+    };
+    //call get memory map again with proper size
+    let status = unsafe{
+            ((*(*system_table).boot).get_memory_map)(
+                    &memory_map_size,
+                    buffer,
+                    &map_key,
+                    &descriptor_size,
+                    &descriptor_version
+            )
+    };
+    if status!=0{
+        return Err(status);
+    }
+
+    Ok((buffer,memory_map_size,map_key))
+}
+fn allocate_pool<T>(system_table:*const SystemTable,size:usize) ->Result<*const T,Status>{
     //extern "efiapi" fn(pool_type:MemoryType,size: usize,buffer:*const *const c_void)-> Status,
 
     let buffer:&&u64 = &&0;
@@ -135,7 +189,7 @@ fn allocate_pool(system_table:*const SystemTable,size:usize) ->Result<*const u8,
     if status !=0{
         return Err(status);
     }
-    let output_buffer:*const u8 = unsafe{transmute(*buffer_ptr)};
+    let output_buffer:*const T = unsafe{transmute(*buffer_ptr)};
     return Ok(output_buffer);
 }
 fn get_kernel_file(system_table:*const SystemTable) -> Result<*const *const FileProtocol,Status>{
@@ -166,8 +220,12 @@ fn get_kernel_file(system_table:*const SystemTable) -> Result<*const *const File
     let kernel_file_handle_buffer:&&[u8;120] = &&[0;120];
     let kernel_file_handle:*const *const FileProtocol =unsafe{transmute(kernel_file_handle_buffer)};
     //open kernel file in read mode
+    let read_status = 
     unsafe{((*(*file_protocol)).open)(*file_protocol,kernel_file_handle,kernel_name.as_ptr(),0x0000000000000001,0)};
 
+    if read_status!=0{
+        return Err(4);
+    }
     return Ok(kernel_file_handle);
 }
 fn get_kernel_size(system_table:*const SystemTable,kernel_file_handle:*const *const FileProtocol) ->Result<usize,Status>{
@@ -232,6 +290,19 @@ fn get_gop(system_table:&SystemTable){
     let _gop = unsafe{((*system_table.boot).locate_protocol)(&guid,0,interface_void)};
 }
 */
+
+fn _free_pool<T>(system_table:*const SystemTable,buffer:*const T) ->Result<(),Status> {
+        let buffer_void:*const c_void = unsafe{transmute(buffer)};
+        let free_mem_status = unsafe{
+            ((*(*system_table).boot).free_pool)(buffer_void)
+        };
+
+        if free_mem_status!=0{
+            return Err(free_mem_status);
+        }
+
+        Ok(())
+}
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> !{
 	loop{}
@@ -248,17 +319,21 @@ impl Writer{
     }
 }
 impl Write for Writer{
-    fn write_str(&mut self,_s:&str) -> core::fmt::Result{
+    fn write_str(&mut self,s:&str) -> core::fmt::Result{
+
+        //using allocate pool for this buffer causes the output text to 
+        // to have invalid unicode characters not sure why
+        let buffer:&mut [u16;512] = &mut [0;512];
         let mut counter = 0;
-        let buffer:&mut [u16] = &mut [0;1024];
-        for chars in _s.chars(){
+        for chars in s.chars(){
             buffer[counter] = chars as u16;
             counter +=1;
         }
-        let buffer_2:&u16 = unsafe{transmute(&buffer[0])};
+
         unsafe{
-            ((*(*self.system_table).output).output_string)((*self.system_table).output,buffer_2);
+            ((*(*self.system_table).output).output_string)((*self.system_table).output,&buffer[0]);
         }
+
         Ok(())
     }
 }

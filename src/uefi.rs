@@ -37,7 +37,7 @@ pub struct TextInputProtocol{
 #[repr(C)]
 pub struct TextOutputProtocol{
     reset: extern "efiapi" fn(output_protocol:&TextOutputProtocol,verification:u8)-> Status,
-    pub output_string: extern "efiapi" fn(output_protocol:*const TextOutputProtocol,string :&u16)-> Status,
+    pub output_string: extern "efiapi" fn(output_protocol:*const TextOutputProtocol,string :*const u16)-> Status,
     test_output: u64,
     query_mode: u64,
     set_mode: u64,
@@ -71,9 +71,9 @@ pub struct BootServices{
     //memory related services
     pub allocate_pages:             extern "efiapi" fn(allocate_type:AllocType,mem_type:MemoryType,pages:usize,address:* const PhysicalAddress)->Status,
     free_pages:                     extern "efiapi" fn(memory:u64,pages:usize)->Status,
-    get_memory_map:                 u64,
+    pub get_memory_map:             extern "efiapi" fn(memory_map_size:*const  usize,memory_map:*const u8,map_key:*const usize,descriptor_size:*const usize,descriptor_version:*const usize) ->Status,
     pub allocate_pool:              extern "efiapi" fn(pool_type:MemoryType,size: usize,buffer:*const *const c_void)-> Status,
-    free_pool:                      u64,
+    pub free_pool:                  extern "efiapi" fn(buffer:*const c_void)->Status,
     //event services
     create_event:                   u64,
     set_timer:                      u64,
@@ -120,6 +120,10 @@ pub struct BootServices{
     copy_mem:                       u64,
     set_mem:                        u64,
     create_event_ex:                u64,
+}
+#[repr(C)]
+pub struct _MemoryMapDescriptor{
+
 }
 #[repr(C)]
 pub struct GUID{
