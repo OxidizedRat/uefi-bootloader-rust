@@ -69,7 +69,7 @@ pub struct BootServices{
     raise_tpl:                      u64,
     restore_tpl:                    u64,
     //memory related services
-    pub allocate_pages:             extern "efiapi" fn(allocate_type:AllocType,mem_type:MemoryType,pages:usize,address:* const PhysicalAddress)->Status,
+    pub allocate_pages:             extern "efiapi" fn(allocate_type:AllocType,mem_type:MemoryType,pages:usize,address:*const PhysicalAddress)->Status,
     free_pages:                     extern "efiapi" fn(memory:u64,pages:usize)->Status,
     pub get_memory_map:             extern "efiapi" fn(memory_map_size:*const  usize,memory_map:*const u8,map_key:*const usize,descriptor_size:*const usize,descriptor_version:*const usize) ->Status,
     pub allocate_pool:              extern "efiapi" fn(pool_type:MemoryType,size: usize,buffer:*const *const c_void)-> Status,
@@ -96,7 +96,7 @@ pub struct BootServices{
     image_start:                    u64,
     exit:                           u64,
     image_unload:                   u64,
-    exit_boot_services:             u64,
+    pub exit_boot_services:         extern "efiapi" fn(image_handel: Handle,map_key:usize) -> Status,
     //miscellaneous
     get_next_monotonic_count:       u64,
     stall:                          u64,
@@ -122,8 +122,13 @@ pub struct BootServices{
     create_event_ex:                u64,
 }
 #[repr(C)]
-pub struct _MemoryMapDescriptor{
-
+#[derive(Debug)]
+pub struct MemoryMapDescriptor{
+    mem_type:u32,
+    physical_start:u64,
+    virtual_start:u64,
+    no_of_pages:u64,
+    attribute:u64,
 }
 #[repr(C)]
 pub struct GUID{
@@ -159,27 +164,21 @@ pub enum MemoryType{
     EfiUnacceptedMemoryType,
     EfiMaxMemoryType,
 }
-
-
 #[repr(C)]
 pub enum SearchType{
     _AllHandles,
     _ByRegisterNotify,
     _ByProtocol,
 }
-
-
 #[repr(C)]
 pub struct ConfigurationTable{
     _non_exhaustive: ()
 }
-
 #[repr(C)]
 pub struct SimpleFileSystemProtocol{
     revision:   u64,
     pub open_volume: extern "efiapi" fn(this:*const SimpleFileSystemProtocol,root:*const *const FileProtocol) -> Status,
 }
-
 #[repr(C)]
 pub struct FileProtocol{
     revision: u64,
@@ -198,43 +197,47 @@ pub struct FileProtocol{
     write_ex:   u64,
     flush_ex:   u64,
 }
-
 #[repr(C)]
-pub struct _GraphicsOutputProtocol{
-    query_mode: u64,
-    set_mode:   u64,
+#[derive(Copy,Clone)]
+pub struct GraphicsOutputProtocol{
+    pub query_mode: extern "efiapi" fn(this:*const GraphicsOutputProtocol,mode_number:u32,size_of_info:*const usize,info:*const *const GOPModeInformation)->Status,
+    pub set_mode:   extern "efiapi" fn(this:*const GraphicsOutputProtocol, mode: u32) ->Status,
     blt:        u64,
-    mode:   *const _GOPMode,
+    pub mode:   *const GOPMode,
 }
 #[repr(C)]
-pub struct _GOPMode{
-    max_mode:   u32,
-    mode:   u32,
-    info: *const _GOPModeInformation,
+#[derive(Debug,Copy,Clone)]
+pub struct GOPMode{
+    pub max_mode:   u32,
+    pub mode:   u32,
+    info: *const GOPModeInformation,
     size_of_info:   usize,
-    framebuffer_base:   PhysicalAddress,
-    framebuffer_size:   usize,
+    pub framebuffer_base:   PhysicalAddress,
+    pub framebuffer_size:   usize,
 }
 #[repr(C)]
-pub struct _GOPModeInformation{
+#[derive(Debug,Copy,Clone)]
+pub struct GOPModeInformation{
     version:    u32,
-    horizontal_resolution:  u32,
-    vertical_resolution:    u32,
-    pixel_format:   _PixelFormat,
-    pixel_information:  _PixelBitmask,
+    pub horizontal_resolution:  u32,
+    pub vertical_resolution:    u32,
+    pub pixel_format:   PixelFormat,
+    pixel_information:  PixelBitmask,
     pixels_per_line:    u32,
 }
 
  #[repr(C)]
- pub enum _PixelFormat{
-     PixelRedGreenBlueReserved8BitPerColor,
-     PixelBlueGreenRedReserved8BitPerColor,
-     PixelBitMask,
-     PixelBltOnly,
-     PixelFormatMax,
+ #[derive(Debug,Copy,Clone)]
+ pub enum PixelFormat{
+     _PixelRedGreenBlueReserved8BitPerColor,
+     _PixelBlueGreenRedReserved8BitPerColor,
+     _PixelBitMask,
+     _PixelBltOnly,
+     _PixelFormatMax,
  }
 #[repr(C)]
-pub struct _PixelBitmask{
+#[derive(Debug,Copy,Clone)]
+pub struct PixelBitmask{
     red_mask:   u32,
     green_mask: u32,
     blue_mask:  u32,
