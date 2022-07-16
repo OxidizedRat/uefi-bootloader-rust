@@ -11,4 +11,7 @@ edition = "2021"
 #panic="abort"
 
 [dependencies]
+uefi = { version = "0.16.0", features = ["exts"] }
+uefi-services = "0.13.0"
+log = "0.4.17"
 xmas-elf = "0.8.0"
