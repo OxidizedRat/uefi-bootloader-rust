@@ -20,4 +20,4 @@ cargo +nightly build  -Z build-std=core,compiler_builtins,alloc,panic_abort,std 
 
 ## To do ##
 
-* kernel returns garbage, likely issue with how it is loaded into memory.
+* Allocate structs passed to the kernel on the heap, currently on bootloader stack, accessing these from the kernel will cause a CPU fault. 
