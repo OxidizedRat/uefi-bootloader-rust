@@ -6,18 +6,20 @@ a UEFI bootloader written in rust for a personal project
 Loads an elf binary named "kernel" from the root directory of the efi partition and transfers control to it.
 ### How it does it ###
 *   Loads kernel into memory.
-*   Gets GOP and sets mode to the highest resolution.
-*   Gets address of framebuffer.
-*   Gets memory map.
-*   Exits boot services.
-*   Calls kernel entry point and passes pointer to system table along with GOP and memory map.
+*   Gets GOP.
+*   Gets framebuffer information.
+*   exit boot services is called, which also gives us the memory map.
+*   Calls kernel entry point and passes pointer to framebuffer information and memory map.
 
 ## Building ##
-The build.sh file contains the following cargo command:
+The following command should suffice:
 ```
-cargo +nightly build  -Z build-std=core,compiler_builtins,alloc,panic_abort,std -Z build-std-features=compiler-builtins-mem  --target x86_64-unknown-uefi
+cargo build
+```
+## Expected Kernel Entry Point ##
+
+```Rust
+  fn(frame_buffer: &mut FrameBuffer, mem_map_buf: &mut [u8]) -> !;
 ```
 
-## To do ##
-
-* Allocate structs passed to the kernel on the heap, currently on bootloader stack, accessing these from the kernel will cause a CPU fault. 
+FrameBuffer is defined on line 169 in main.rs
