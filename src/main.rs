@@ -72,7 +72,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         Ok(bytes_read) => info!("Read {} bytes from kernel", bytes_read),
         Err(why) => {
             error!("Failed to read kernel!:{:?}", why);
-            panic! {}
+            loop{}
         }
     }
     //parse buffer with xmas elf
@@ -80,7 +80,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         Ok(elf) => elf,
         Err(why) => {
             error!("{}", why);
-            panic!();
+            loop{}
         }
     };
     //get kernel entry point ptr
@@ -147,17 +147,18 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     let framebuffer = FrameBuffer::new(gop);
     let framebuffer = Box::leak(framebuffer);
-    info!("running kernel");
+    info!("Calling kernel");
     //get memory map size and create a buffer for memory map before calling exit boot services
     let size = BootServices::memory_map_size(&system_table.boot_services());
     let map_size = size.map_size;
     let entry_size = size.entry_size;
     let mut mem_map_buf: Vec<u8> = Vec::new();
     mem_map_buf.resize(map_size + entry_size * 10, 0);
+    //exit boot services
     system_table.exit_boot_services(handle, &mut mem_map_buf);
     kernel_main(framebuffer, &mut mem_map_buf);
     //kernel never returns so we should never get here
-    loop {}
+  
 }
 //get graphics output protocol
 fn get_gop(sys: &SystemTable<Boot>) -> &UnsafeCell<GraphicsOutput> {
