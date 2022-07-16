@@ -1,515 +1,193 @@
 #![no_std]
 #![no_main]
 #![feature(abi_efiapi)]
-#![feature(default_alloc_error_handler)]
+use core::{cell::UnsafeCell, *};
+extern crate alloc;
+use alloc::vec::Vec;
+use alloc::{boxed::Box, vec};
+use log::{error, info};
+use uefi::{prelude::*, proto::console::gop::*, proto::media::file::*, table::boot::*};
+use xmas_elf::{program::*, *};
 
-use core::panic::PanicInfo;
-mod uefi;
-use crate::uefi::*;
-use core::ffi::c_void;
-use core::fmt::Write;
-use core::mem::transmute;
-use xmas_elf::ElfFile;
+#[entry]
+fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
+    uefi_services::init(&mut system_table).unwrap();
 
-
-static mut WRITER_PTR:u64 = 0;
-
-#[no_mangle]
-pub extern "efiapi" fn efi_main(handle:Handle,system_table:*const SystemTable)->!{
-    //init Writer
-    let mut writer = &mut Writer::init(system_table);
-
-    //global writer for panic info
-    unsafe{
-        WRITER_PTR = writer as *mut Writer as u64;
-    }
-
-    //check for kernel file and get a handle to it
-    let kernel = match get_kernel_file(system_table){
-        Ok(proto) => proto,
+    //get systemtable ptr reference for use with fs protocol
+    let system_table_fs = uefi_services::system_table().as_ptr();
+    //get simple file system protocol
+    let simple_fs = unsafe {
+        match BootServices::get_image_file_system((*system_table_fs).boot_services(), handle) {
+            Ok(sfs) => sfs,
+            Err(why) => {
+                error! {"{:?}",why};
+                loop {}
+            }
+        }
+    };
+    //open the root directory
+    let mut directory: Directory = unsafe { (*simple_fs.interface.get()).open_volume().unwrap() };
+    //open file named kernel
+    let kernel_path = cstr16!("kernel");
+    let kernel_handle = match directory.open(kernel_path, FileMode::Read, FileAttribute::empty()) {
+        Ok(handle) => handle,
         Err(why) => {
-                write!(writer,"Could not get kernel, Error :{}\n\r",why).expect("write error");
-                loop{};
+            error!("Could not find kernel {:?}", why);
+            loop {}
         }
     };
-    //get the kernel size so we can create a buffer of size kernel_size
-    let kernel_size =  match get_kernel_size(system_table,kernel){
-        Ok(size)    => size,
-        Err(why)    => {
-            write!(writer,"Could not get kernel size, Error :{}\n\r",why).expect("write error");
-            loop{};
+    let mut kernel_file = match kernel_handle.into_regular_file() {
+        Some(reg_file) => reg_file,
+        None => {
+            error!("Kernel is not a file");
+            loop {}
         }
     };
-    write!(writer,"kernel size: {}\n\r",kernel_size).expect("write error");
-    //allocate memory for buffer
-    let kernel_buffer_ptr = match allocate_pool(system_table,kernel_size){
-        Ok(ptr)     => ptr,
-        Err(why)    => {
-            write!(writer,"Could not Allocate memory for kernel, Error :{}\n\r",why).expect("write error");
-            loop{};
+    info!("Kernel Found");
+    //get kernel info, status 4 is buffer_too_small
+    //first run with a blank buffer to get the required size
+    let mut kernel_info_buffer: Vec<u8> = Vec::new();
+    let mut req_size = 0;
+    match kernel_file.get_info::<FileInfo>(&mut kernel_info_buffer) {
+        Ok(_) => (),
+        Err(err) if err.status() == Status::BUFFER_TOO_SMALL => req_size = err.data().unwrap(),
+        Err(why) => {
+            error!("{:?}", why);
+            loop {}
         }
     };
-
-    let fill_kernel_buffer =get_kernel_buffer(kernel,&kernel_size,kernel_buffer_ptr);
-    if fill_kernel_buffer !=0{
-        write!(writer,"could not read kernel file, Error:{}\n\r",fill_kernel_buffer).expect("write error");
-        loop{};
+    //set required size and try again
+    kernel_info_buffer.resize(req_size, 0);
+    let kernel_info = match kernel_file.get_info::<FileInfo>(&mut kernel_info_buffer) {
+        Ok(info) => info,
+        Err(why) => {
+            error!("2{:#?}", why);
+            loop {}
+        }
+    };
+    //get size of kernel and create buffer to read kernel into
+    let kernel_size = kernel_info.file_size();
+    let mut kernel_buffer: Vec<u8> = vec![0; kernel_size.try_into().unwrap()];
+    match kernel_file.read(&mut kernel_buffer) {
+        Ok(bytes_read) => info!("Read {} bytes from kernel", bytes_read),
+        Err(why) => {
+            error!("Failed to read kernel!:{:?}", why);
+            panic! {}
+        }
     }
-    let kernel_buffer  = unsafe{core::slice::from_raw_parts(kernel_buffer_ptr,kernel_size)};
-    let kernel_elf = load_kernel(system_table,writer,kernel_buffer);
-    write!(&mut writer,"Kernel Loaded.\n\r").expect("Write error");
-
-    //set up GOP 
-    let gop = match get_gop(system_table) {
-        Ok(ptr)     => ptr,
-        Err(why)    => {
-            write!(&mut writer,"Could not start GOP, Error: {:#0x}\n\r",why).expect("Write error");
-            loop{}
+    //parse buffer with xmas elf
+    let kernel_elf = match ElfFile::new(&kernel_buffer) {
+        Ok(elf) => elf,
+        Err(why) => {
+            error!("{}", why);
+            panic!();
         }
     };
-    write!(&mut writer,"GOP acquired.\n\r").expect("Write error");
-    
-    //get the highest resolution possible
-    let _set_mode = match set_max_mode(gop){
-        Ok(())        => (),
-        Err(why)    =>{
-            write!(&mut writer,"could not set display mode, Error: {:#0x}",why).expect("Write error");
-            loop{}
-        }
-    };
-    
-    
-    let framebuffer_info = match get_framebuffer_info(gop){
-        Ok(info)    => info,
-        Err(why)    => {
-            write!(&mut writer,"failed to get fb info, Error: {}\n\r",why).expect("Write error");
-            loop{}
-        }
-    };
-    
-    //get the entry point
-    let entry_point:u64 = kernel_elf.header.pt2.entry_point();
-    //convert address to function pointer
-    let exec_kernel: fn(system_table:*const SystemTable,gop:FramebufferInfo,memory_map:MemoryInfo) -> ! = unsafe{transmute(entry_point)};
-
-    //get memory map
-    let mem_map = match get_memory_map(system_table, writer){
-        Ok(mem_tuple)   => mem_tuple,
-        Err(why)        => {
-            write!(&mut writer,"failed to get memory map,Error: {:#0x}\n\r",why).expect("");
-            loop{}
-        }
-    };
-   
-    //exit boot sevices
-    let exit_status = unsafe{
-        ((*(*system_table).boot).exit_boot_services)(handle,mem_map.map_key)
-    };
-    if exit_status !=0{
-        write!(&mut writer,"exit boot services failed with error code: {:#0x}",exit_status).expect("write error");
-        loop{}
-    }
-    //run kernel
-    exec_kernel(system_table,framebuffer_info,mem_map);
-    loop{}
-    //return 1;
-}
-
-//load the kernel into memory
-fn load_kernel(system_table:*const SystemTable,writer:&mut Writer,kernel_buffer:&'static [u8]) ->ElfFile<'static> {
-    //parse our buffer
-    let kernel_elf = match ElfFile::new(kernel_buffer){
-        Ok(elf)   => elf,
-        Err(why)  => {
-            write!(writer,"Failed to read kernel binary: {}\n\r",why).expect("");
-            loop{}
-        }
-    };
-    
-     //load the load type headers into memory
-     for p_header in kernel_elf.program_iter(){
-        let p_type = match p_header.get_type(){
-            Ok(header) => header,
-            Err(_)     => continue,
-        };
-        //iterate trough the program headers and get the headers
-        //with type load
-        if p_type == xmas_elf::program::Type::Load{
-
-            let mut address = p_header.physical_addr();
-            let mut offset_mem:u64 = 0;
-            //make the address 4096 aligned
-            if address % 4096 !=0{
-                offset_mem = address%4096;
-                address = address - offset_mem;
-            }
-           
-            let no_pages =  ((p_header.mem_size() + offset_mem)/4096)+1;
-        
-            let status = allocate_pages(system_table,&address,no_pages as usize);
-     
-            if status !=0{
-                write!(writer,"Address:{:#0x}, Error code:{:#0x}\n\r",address,status).expect("write error");
-                loop{}
-            }
-
-            //ensure we have enough space to load data
-            let slice_size = (4096*no_pages)-offset_mem;
-            if p_header.mem_size() > slice_size{
-                write!(writer,"slice:{} , mem: {}",slice_size,p_header.mem_size()).expect("Write error");
-                write!(writer,"could not allocate enoguh space for kernel!\n\r").expect("Write error");
-                loop{}
-            }
-            {
-                //zero out the pages we just created
-                let page_slice = unsafe{
-                    core::slice::from_raw_parts_mut(
-                        address as *mut u8,
-                        (4096*no_pages) as usize,
-                    )
+    //get kernel entry point ptr
+    let entry_point = kernel_elf.header.pt2.entry_point();
+    //create a buffer to hold vecs of loaded section
+    //unsure if the destructor for the loaded sections will be called therefore adding them
+    //to this vec
+    let mut loaded_sections: Vec<Vec<u8>> = Vec::new();
+    //iterate over the program headers and load each header of type load
+    for header in kernel_elf.program_iter() {
+        if header.get_type().unwrap() == Type::Load {
+            let virt_addr = header.virtual_addr();
+            let file_size: usize = header.file_size().try_into().unwrap();
+            let mem_size = header.mem_size();
+            let file_offset: usize = header.offset().try_into().unwrap();
+            //align address on 4k boundary
+            let address = virt_addr - (virt_addr % 4096);
+            let mem_size_actual = (virt_addr - address) + mem_size;
+            //compute number of pages required
+            let num_pages: usize = ((mem_size_actual / 4096) + 1).try_into().unwrap();
+            //get ptr to system table for allocate pages call
+            let table = uefi_services::system_table().as_ptr();
+            unsafe {
+                let ptr = match BootServices::allocate_pages(
+                    (*table).boot_services(),
+                    AllocateType::Address(address.try_into().unwrap()),
+                    MemoryType(2),
+                    num_pages,
+                ) {
+                    Ok(addr) => addr,
+                    Err(why) => {
+                        error!("Failed to allocate pages:{:?}", why);
+                        loop {}
+                    }
                 };
-                for byte in page_slice.iter_mut(){
+                //create a vec from allocated buffer and fill it with zeros
+                let mut buffer =
+                    Vec::from_raw_parts(ptr as *mut u8, num_pages * 4096, num_pages * 4096);
+                for byte in buffer.iter_mut() {
                     *byte = 0;
                 }
-            }
-            //get a slice to the page we just allocated
-            let load_slice = unsafe{
-                core::slice::from_raw_parts_mut(
-                    (address+offset_mem) as *mut u8, 
-                    slice_size as usize)
-            };
-            //zero out the slice
-            for byte in load_slice.iter_mut(){
-                *byte = 0;
-            }
-            //fill our slice with the required data
-            let offset = p_header.offset() as usize;
-
-            let header_size = p_header.file_size() as usize + offset;
-
-            let mut kernel_index = 0;
-            let mut load_index = 0;
-            //cant randomly access parts of kernel_buffer slice as constants
-            //are not used to define its size
-            for byte in kernel_buffer{
-                if kernel_index >=offset && kernel_index<=header_size{
-                    load_slice[load_index] = *byte;
-                    load_index+=1;
+                //compute offset of the data with in the kernel buffer to be copied to memory
+                let offset: usize = (virt_addr - address).try_into().unwrap();
+                //start index for buffer
+                let mut start_index: usize = (offset).try_into().unwrap();
+                for byte in &kernel_buffer[file_offset..(file_offset + file_size)] {
+                    buffer[start_index] = *byte;
+                    start_index += 1;
                 }
-                kernel_index+=1;
+                //unsure if destructor will be called for our buffer when it goes out of scope,
+                // therefore push it to a vector outside of for loop
+                //global allocator's dealloc may be capable of deallocating our buffer
+                loaded_sections.push(buffer);
             }
         }
-
     }
-    kernel_elf
+    //our kernel's entry point's prototype
+    type KernelMain = fn(frame_buffer: &mut FrameBuffer, mem_map_buf: &mut [u8]) -> !;
+    let kernel_main: KernelMain;
+    unsafe {
+        kernel_main = core::mem::transmute(entry_point);
+    }
+    let gop = get_gop(&system_table).get();
+
+    let framebuffer = FrameBuffer::new(gop);
+    let framebuffer = Box::leak(framebuffer);
+    info!("running kernel");
+    //get memory map size and create a buffer for memory map before calling exit boot services
+    let size = BootServices::memory_map_size(&system_table.boot_services());
+    let map_size = size.map_size;
+    let entry_size = size.entry_size;
+    let mut mem_map_buf: Vec<u8> = Vec::new();
+    mem_map_buf.resize(map_size + entry_size * 10, 0);
+    system_table.exit_boot_services(handle, &mut mem_map_buf);
+    kernel_main(framebuffer, &mut mem_map_buf);
+    //kernel never returns so we should never get here
+    loop {}
 }
-fn get_framebuffer_info(gop:*const GraphicsOutputProtocol) -> Result<FramebufferInfo,Status>{
-    let mode:u32 = unsafe{
-        (*(*gop).mode).mode
-    };
-    let mode_info = match query_mode(gop,mode){
-        Ok(info)       => info,
-        Err(why)       => return Err(why),
-    };
-    
-    let horizontal_resolution = unsafe{
-        (*mode_info).horizontal_resolution
-    };
-
-    let vertical_resolution = unsafe{
-        (*mode_info).vertical_resolution
-    };
-
-    let framebuffer_addr = unsafe{
-        (*(*gop).mode).framebuffer_base
-    };
-    let framebuffer_size = unsafe{
-        (*(*gop).mode).framebuffer_size
-    };
-
-    let pixel_format = unsafe{
-        (*mode_info).pixel_format.clone()
-    };
-
-    let framebuffer_info = FramebufferInfo{
-        horizontal_resolution: horizontal_resolution,
-        vertical_resolution: vertical_resolution,
-        framebuffer: framebuffer_addr,
-        framebuffer_size: framebuffer_size,
-        pixel_format: pixel_format,
-    };
-    
-    Ok(framebuffer_info)
-
-}
-fn set_max_mode(gop: *const GraphicsOutputProtocol) -> Result<(),Status>{
-    let number_of_modes = unsafe{(*(*gop).mode).max_mode} -1;
-    let set_status = unsafe{
-        ((*gop).set_mode)(gop,number_of_modes)
-    };
-
-    if set_status !=0{
-        return Err(set_status);
-    }
-
-    Ok(())
-}
-fn query_mode(gop:*const GraphicsOutputProtocol,mode:u32) -> Result<*const GOPModeInformation,Status>{
-    //fn(this:*const GraphicsOutputProtocol,mode_number:u32,size_of_info:*const usize,info:*const *const GOPModeInformation)->Status,
-    let size_of_info:usize = 0;
-    let info:&&u64 = &&0;
-
-    let info:*const *const GOPModeInformation = unsafe{transmute(info)};
-
-    let query_status = unsafe{
-        ((*gop).query_mode)(gop,mode,&size_of_info,info)
-    };
-
-    if query_status != 0 {
-        return Err(query_status);
-    }
-
-    Ok(unsafe{*info})
-}
-fn get_memory_map(system_table:*const SystemTable,writer:&mut Writer) -> Result<MemoryInfo,Status>{
-    //fn(memory_map_size:*const  usize,memory_map:*const u8,map_key:*const usize,descriptor_size:*const usize,descriptor_version:*const usize) ->Status,
-    let mut memory_map_size:usize = 0;
-    //null pointer should not get accessed on the first call as memory map size is set to 0
-    let memory_map:*const u8 = unsafe{transmute(memory_map_size)};
-    let map_key:usize = 0;
-    let descriptor_size:usize = 0;
-    let descriptor_version:usize = 0;
-
-    //call get memory map once with size set to 0 so that it returns the required buffer size
-    let first_status = unsafe{
-          ((*(*system_table).boot).get_memory_map)(
-                &memory_map_size,
-                memory_map,
-                &map_key,
-                &descriptor_size,
-                &descriptor_version
-        )
-    };
-    if first_status !=0x8000000000000005{
-        write!(writer,"first mem map call failed\n\r").expect("Write error");
-        return Err(first_status);
-    }
-    //allocating memory for the buffer increases the size of the memory map
-    //therefore we need to increase the size of the buffer we are creating
-    memory_map_size+=200;
-
-    //allocate buffer for memory map
-    let buffer = match allocate_pool::<u8>(system_table,memory_map_size) {
-            Ok(buff)    => buff,
-            Err(why)    => {
-                write!(writer,"Failed to allocate pool, Error :{:#0x}",why).expect("write error");
-                return Err(why);
-            }
-    };
-
-    //call get memory map again with proper size
-    let status = unsafe{
-            ((*(*system_table).boot).get_memory_map)(
-                    &memory_map_size,
-                    buffer,
-                    &map_key,
-                    &descriptor_size,
-                    &descriptor_version
-            )
-    };
-    if status!=0{
-        return Err(status);
-    }
-    let mem_info = MemoryInfo{
-        memory_map: buffer,
-        map_size: memory_map_size,
-        map_key:map_key,
-        descriptor_size:descriptor_size,
-    };
-    Ok(mem_info)
-}
-fn allocate_pool<T>(system_table:*const SystemTable,size:usize) ->Result<*const T,Status>{
-    //extern "efiapi" fn(pool_type:MemoryType,size: usize,buffer:*const *const c_void)-> Status,
-
-    let buffer:&&u64 = &&0;
-    let buffer_ptr: *const *const c_void = unsafe{transmute(buffer)};
-    let status = unsafe{((*(*system_table).boot).allocate_pool)(MemoryType::EfiLoaderData,
-                                                                size,
-                                                                buffer_ptr)};
-    if status !=0{
-        return Err(status);
-    }
-    let output_buffer:*const T = unsafe{transmute(*buffer_ptr)};
-    return Ok(output_buffer);
-}
-fn get_kernel_file(system_table:*const SystemTable) -> Result<*const *const FileProtocol,Status>{
-    let guid = GUID{
-        data1:0x0964e5b22,
-        data2:0x6459,
-        data3:0x11d2,
-        data4:[0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b],
-    };
-    //locate Simple file system protocol
-    let interface:&&u64=&&0;
-    let interface_void:*const *const c_void = unsafe{core::mem::transmute(interface)};
-    let fs_status = unsafe{((*(*system_table).boot).locate_protocol)(&guid,0,interface_void)};
-    
-    if fs_status != 0{
-        return Err(fs_status);
-    }
-    
-    //open root volume handle using simple file system
-    let simple_file_system:*const *const SimpleFileSystemProtocol = unsafe{core::mem::transmute(interface_void)};
-    let file_p:&&[u8;120] = &&[0;120];
-    let file_protocol:*const *const FileProtocol = unsafe{core::mem::transmute(file_p)};
-    let file_status = unsafe{((*(*simple_file_system)).open_volume)(*simple_file_system,file_protocol)};
-
-    if file_status !=0{
-        return Err(2);
-    }
-    //get the kernel file using root volume handle
-    let kernel_name:&[u16;6] = &['k' as u16,'e' as u16,'r' as u16,'n' as u16,'e' as u16,'l' as u16];
-    let kernel_file_handle_buffer:&&[u8;120] = &&[0;120];
-    let kernel_file_handle:*const *const FileProtocol =unsafe{transmute(kernel_file_handle_buffer)};
-    //open kernel file in read mode
-    let read_status = 
-    unsafe{((*(*file_protocol)).open)(*file_protocol,kernel_file_handle,kernel_name.as_ptr(),0x0000000000000001,0)};
-
-    if read_status!=0{
-        return Err(4);
-    }
-    return Ok(kernel_file_handle);
-}
-fn get_kernel_size(system_table:*const SystemTable,kernel_file_handle:*const *const FileProtocol) ->Result<usize,Status>{
-
-    //file info GUID
-    let file_info_guid = GUID{
-        data1:0x09576e92,
-        data2:0x6d3f,
-        data3:0x11d2,
-        data4:[0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b],
-    };
-    let allocated_address:&&u64 = &&0;
-    let allocated_address:*const *const c_void = unsafe{transmute(allocated_address)};
-    //allocate memory for fileinfo struct
-    let status_pool = unsafe{((*(*system_table).boot).allocate_pool)(MemoryType::EfiLoaderData,200,allocated_address)};
-
-    if status_pool!=0{
-        return Err(3);
-    }
-
-    //get file info struct
-    let file_info_status = unsafe{((*(*kernel_file_handle)).get_info)(*kernel_file_handle,&file_info_guid,&200,*allocated_address)};
-    if file_info_status!=0{
-        return Err(5);
-    }
-    let file_info_struct:*const FileInfo = unsafe{transmute(*allocated_address)};
-
-    return Ok(unsafe{(*file_info_struct).file_size.try_into().unwrap()});
+//get graphics output protocol
+fn get_gop(sys: &SystemTable<Boot>) -> &UnsafeCell<GraphicsOutput> {
+    let gop = BootServices::locate_protocol::<GraphicsOutput>(sys.boot_services()).unwrap();
+    return gop;
 }
 
-fn get_kernel_buffer(kernel_file_handle:*const *const FileProtocol,kernel_size:*const usize,buffer_ptr:*const u8)->Status{
-    //prepare buffer
-    let kernel_buffer_void: *const c_void = unsafe{transmute(buffer_ptr)};
-    //read the contents into a buffer
-    let status = unsafe{((*(*kernel_file_handle)).read)(*kernel_file_handle,kernel_size,kernel_buffer_void)};
-
-    return status;
+struct FrameBuffer {
+    _base_address: *mut u8,
+    _size: usize,
+    _width: usize,
+    _height: usize,
+    _stride: usize,
 }
 
-fn allocate_pages(system_table:*const SystemTable,address:*const u64,size:usize)->Status{
-
-    let status = unsafe{
-        ((*(*system_table).boot).allocate_pages)(AllocType::AllocateAddress,
-                                                 MemoryType::EfiLoaderData,
-                                                 size,
-                                                 address)
-    };
-    status
-}
-
-
-fn get_gop(system_table:*const SystemTable) -> Result<*const GraphicsOutputProtocol,Status>{
-    let guid = GUID{
-        data1:0x9042a9de,
-        data2:0x23dc,
-        data3:0x4a38,
-        data4:[0x96,0xfb,0x7a,0xde,0xd0,0x80,0x51,0x6a],
-    };
-
-    let interface:&&u128=&&0;
-    let interface_void:*const *const c_void = unsafe{core::mem::transmute(interface)};
-    let gop_status = unsafe{((*(*system_table).boot).locate_protocol)(&guid,0,interface_void)};
-    if gop_status != 0 {
-        return Err(gop_status);
-    }       
-    let gop: *const GraphicsOutputProtocol = unsafe{transmute(*interface_void)};
-    Ok(gop)
-}
-
-
-fn _free_pool<T>(system_table:*const SystemTable,buffer:*const T) ->Result<(),Status> {
-        let buffer_void:*const c_void = unsafe{transmute(buffer)};
-        let free_mem_status = unsafe{
-            ((*(*system_table).boot).free_pool)(buffer_void)
+impl FrameBuffer {
+    pub fn new(gop: *mut GraphicsOutput) -> Box<FrameBuffer> {
+        let base_address = unsafe { (*gop).frame_buffer().as_mut_ptr() };
+        let size = unsafe { (*gop).frame_buffer().size() };
+        let (width, height) = unsafe { (*gop).current_mode_info().resolution() };
+        let stride = unsafe { (*gop).current_mode_info().stride() };
+        let fb = FrameBuffer {
+            _base_address: base_address,
+            _size: size,
+            _width: width,
+            _height: height,
+            _stride: stride,
         };
 
-        if free_mem_status!=0{
-            return Err(free_mem_status);
-        }
-
-        Ok(())
-}
-#[panic_handler]
-fn panic(info: &PanicInfo) -> !{
-    let writer:&mut Writer = unsafe{transmute(WRITER_PTR)};
-    write!(writer,"{:?}",info).expect("Panic Info write error");
-    loop{}
-}
-
-struct Writer{
-    system_table:*const SystemTable,
-}
-impl Writer{
-    fn init(system_table:*const SystemTable) -> Writer{
-        Writer{
-            system_table: system_table,
-        }
+        let fb_heap = Box::new(fb);
+        fb_heap
     }
-}
-impl Write for Writer{
-    fn write_str(&mut self,s:&str) -> core::fmt::Result{
-
-        //using allocate pool for this buffer causes the output text to 
-        // to have invalid unicode characters not sure why
-        let buffer:&mut [u16;512] = &mut [0;512];
-        let mut counter = 0;
-        for chars in s.chars(){
-            buffer[counter] = chars as u16;
-            counter +=1;
-        }
-
-        unsafe{
-            ((*(*self.system_table).output).output_string)((*self.system_table).output,&buffer[0]);
-        }
-
-        Ok(())
-    }
-}
-#[repr(C)]
-#[derive(Debug,Clone,Copy)]
-struct FramebufferInfo{
-    horizontal_resolution: u32,
-    vertical_resolution:    u32,
-    framebuffer:    u64,
-    framebuffer_size:   usize,
-    pixel_format: PixelFormat,
-}
-#[repr(C)]
-#[derive(Clone,Copy)]
-struct MemoryInfo{
-    memory_map:*const u8,
-    map_size:usize,
-    map_key:usize,
-    descriptor_size:usize,
 }
