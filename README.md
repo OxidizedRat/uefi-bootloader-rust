@@ -19,7 +19,6 @@ cargo build
 ## Expected Kernel Entry Point ##
 
 ```Rust
-  fn(frame_buffer: &mut FrameBuffer, mem_map_buf: &mut [u8]) -> !;
+  extern "efiapi" fn(fb_info:FramebufferInfo,system_table:SystemTable<Runtime>,memory_map:MemoryMap) -> ! 
 ```
 
-FrameBuffer is defined on line 169 in main.rs
