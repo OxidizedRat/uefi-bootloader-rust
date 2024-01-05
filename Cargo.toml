@@ -1,17 +1,10 @@
 [package]
-name = "uefi-bootloader"
+name = "bootloader"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-#[profile.dev]
-#panic="abort"
-
-#[profile.release]
-#panic="abort"
 
 [dependencies]
-uefi = { version = "0.16.0", features = ["exts"] }
-uefi-services = "0.13.0"
-log = "0.4.17"
-xmas-elf = "0.8.0"
+uefi = "0.26.0"
+xmas-elf = "0.9.1"

@@ -1,194 +1,269 @@
 #![no_std]
 #![no_main]
-#![feature(abi_efiapi)]
-use core::{cell::UnsafeCell, *};
-extern crate alloc;
-use alloc::vec::Vec;
-use alloc::{boxed::Box, vec};
-use log::{error, info};
-use uefi::{prelude::*, proto::console::gop::*, proto::media::file::*, table::boot::*};
-use xmas_elf::{program::*, *};
+#[allow(unused)]
+use core::fmt::Write;
+use core::panic::PanicInfo;
+use uefi::proto::media::file::File;
+use uefi::proto::media::file::FileAttribute;
+use uefi::proto::media::file::FileMode;
+use uefi::table::boot::MemoryMap;
+use uefi::table::boot::OpenProtocolAttributes;
+use uefi::table::boot::OpenProtocolParams;
+use uefi::table::Runtime;
+use uefi::{prelude::*, table::boot::MemoryType};
+use xmas_elf::ElfFile;
 
 #[entry]
-fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
-    uefi_services::init(&mut system_table).unwrap();
-
+fn main(handle: Handle, system_table: SystemTable<Boot>) -> Status {
+    //get systemtable clone for use with console protocol
+    let mut system_table_console = unsafe { system_table.unsafe_clone() };
+    //get stdout for write macro
+    let stdout = system_table_console.stdout();
     //get systemtable ptr reference for use with fs protocol
-    let system_table_fs = uefi_services::system_table().as_ptr();
+    let system_table_fs = unsafe { system_table.unsafe_clone() };
     //get simple file system protocol
-    let simple_fs = unsafe {
-        match BootServices::get_image_file_system((*system_table_fs).boot_services(), handle) {
+    let mut simple_fs =
+        match BootServices::get_image_file_system(system_table_fs.boot_services(), handle) {
             Ok(sfs) => sfs,
             Err(why) => {
-                error! {"{:?}",why};
+                writeln! {stdout,"Could not get simple file system protocol{:?}",why}.unwrap();
+                loop {}
+            }
+        };
+    //get root directory
+    let mut root_dir = match simple_fs.open_volume() {
+        Ok(rd) => rd,
+        Err(why) => {
+            writeln! {stdout," Could not open root directory{:?}",why}.unwrap();
+            loop {}
+        }
+    };
+
+    //open file named kernel
+    let file_name = cstr16!("kernel");
+    let mut kernel_file = match root_dir.open(file_name, FileMode::Read, FileAttribute::empty()) {
+        Ok(kf) => kf,
+        Err(why) => {
+            writeln! {stdout,"Could not find kernel{:?}",why}.unwrap();
+            loop {}
+        }
+    };
+    //allocate pool for file info buffer
+    let file_info_buffer_addr = match system_table
+        .boot_services()
+        .allocate_pool(MemoryType::LOADER_DATA, 128)
+    {
+        Ok(fib) => fib,
+        Err(why) => {
+            writeln! {stdout,"Could not allocate pool for file info buffer{:?}",why}.unwrap();
+            loop {}
+        }
+    };
+    //convert file_info_buffer into slice
+    let file_info_buffer = unsafe { core::slice::from_raw_parts_mut(file_info_buffer_addr, 128) };
+    //get file info
+    let file_info =
+        match kernel_file.get_info::<uefi::proto::media::file::FileInfo>(file_info_buffer) {
+            Ok(fi) => fi,
+            Err(why) => {
+                writeln! {stdout,"Could not get file info{:?}",why}.unwrap();
+                loop {}
+            }
+        };
+    let kernel_size = file_info.file_size();
+    //free file info buffer
+    unsafe {
+        match system_table
+            .boot_services()
+            .free_pool(file_info_buffer_addr)
+        {
+            Ok(_) => {}
+            Err(why) => {
+                writeln! {stdout,"Could not free pool for file info buffer{:?}",why}.unwrap();
+                loop {}
+            }
+        };
+    }
+    writeln! {stdout,"Kernel size: {}",kernel_size}.unwrap();
+    //allocate pool for kernel
+    let kernel_buffer_addr = match system_table
+        .boot_services()
+        .allocate_pool(MemoryType::LOADER_DATA, kernel_size as usize)
+    {
+        Ok(kb) => kb,
+        Err(why) => {
+            writeln! {stdout,"Could not allocate pool for kernel buffer{:?}",why}.unwrap();
+            loop {}
+        }
+    };
+
+    //convert kernel_buffer into slice
+    let kernel_buffer =
+        unsafe { core::slice::from_raw_parts_mut(kernel_buffer_addr, kernel_size as usize) };
+    //convert kernel_file into regular file
+    let mut kernel_file = unsafe { uefi::proto::media::file::RegularFile::new(kernel_file) };
+    //read kernel into kernel_buffer
+    match kernel_file.read(kernel_buffer) {
+        Ok(_) => {}
+        Err(why) => {
+            writeln! {stdout,"Could not read kernel into kernel buffer{:?}",why}.unwrap();
+            loop {}
+        }
+    };
+    //parse kernel as elf
+    let kernel_elf = match ElfFile::new(kernel_buffer) {
+        Ok(ke) => ke,
+        Err(why) => {
+            writeln! {stdout,"Could not parse kernel as elf{:?}",why}.unwrap();
+            loop {}
+        }
+    };
+
+    //iterate over program headers and get headers of type load
+    for ph in kernel_elf.program_iter() {
+        if ph.get_type() == Ok(xmas_elf::program::Type::Load) {
+            //get segment size
+            let segment_size = ph.mem_size() as usize;
+            //allocate pool for segment
+            let segment_buffer_addr = match system_table
+                .boot_services()
+                .allocate_pool(MemoryType::LOADER_DATA, segment_size)
+            {
+                Ok(sb) => sb,
+                Err(why) => {
+                    writeln! {stdout,"Could not allocate pool for segment buffer{:?}",why}.unwrap();
+                    loop {}
+                }
+            };
+            //convert segment_buffer into slice
+            let segment_offset = ph.offset() as usize;
+            let segment_buffer =
+                unsafe { core::slice::from_raw_parts_mut(segment_buffer_addr, segment_size) };
+            //copy segment into segment_buffer
+            segment_buffer
+                .copy_from_slice(&kernel_buffer[segment_offset..segment_offset + segment_size]);
+            //get segment destination address
+            let segment_dest_addr = ph.physical_addr() as usize;
+            //calculate number of pages required for segment
+            let num_pages = (segment_size + 0xfff) / 0x1000;
+            //get aligned segment destination address
+            let aligned_segment_dest_addr = segment_dest_addr - (segment_dest_addr % 4096);
+            //allocate pages for segment
+            match system_table.boot_services().allocate_pages(
+                uefi::table::boot::AllocateType::Address(aligned_segment_dest_addr as u64),
+                MemoryType::LOADER_CODE,
+                num_pages,
+            ) {
+                Ok(addr) => addr,
+                Err(why) => {
+                    writeln! {stdout,"Could not allocate pages for segment{:?}",why}.unwrap();
+                    loop {}
+                }
+            };
+            //zero out allocated pages
+            unsafe {
+                core::ptr::write_bytes(aligned_segment_dest_addr as *mut u8, 0, num_pages * 0x1000);
+            }
+            //copy segment into segment_dest_addr
+            unsafe {
+                core::ptr::copy(
+                    segment_buffer_addr as *const u8,
+                    segment_dest_addr as *mut u8,
+                    segment_size,
+                );
+            }
+            //free segment buffer
+            unsafe {
+                match system_table.boot_services().free_pool(segment_buffer_addr) {
+                    Ok(_) => {}
+                    Err(why) => {
+                        writeln! {stdout,"Could not free pool for segment buffer{:?}",why}.unwrap();
+                        loop {}
+                    }
+                };
+            }
+        }
+    }
+    writeln! {stdout,"Kernel loaded"}.unwrap();
+
+    //get handle for gop
+    let gop_handle = match system_table
+        .boot_services()
+        .get_handle_for_protocol::<uefi::proto::console::gop::GraphicsOutput>()
+    {
+        Ok(gh) => gh,
+        Err(why) => {
+            writeln! {stdout,"Could not get handle for gop{:?}",why}.unwrap();
+            loop {}
+        }
+    };
+    //get gop
+    let params: OpenProtocolParams = OpenProtocolParams {
+        handle: gop_handle,
+        agent: handle,
+        controller: None,
+    };
+    let system_table_gop = unsafe { system_table.unsafe_clone() };
+    let mut gop = unsafe {
+        match system_table_gop
+            .boot_services()
+            .open_protocol::<uefi::proto::console::gop::GraphicsOutput>(
+                params,
+                OpenProtocolAttributes::GetProtocol,
+            ) {
+            Ok(g) => g,
+            Err(why) => {
+                writeln! {stdout,"Could not get gop{:?}",why}.unwrap();
                 loop {}
             }
         }
     };
-    //open the root directory
-    let mut directory: Directory = unsafe { (*simple_fs.interface.get()).open_volume().unwrap() };
-    //open file named kernel
-    let kernel_path = cstr16!("kernel");
-    let kernel_handle = match directory.open(kernel_path, FileMode::Read, FileAttribute::empty()) {
-        Ok(handle) => handle,
-        Err(why) => {
-            error!("Could not find kernel {:?}", why);
-            loop {}
-        }
+    writeln! {stdout,"Got gop"}.unwrap();
+    //get framebuffer address
+    let framebuffer_addr = gop.frame_buffer().as_mut_ptr();
+    let framebuffer_size = gop.frame_buffer().size();
+    let (framebuffer_width, framebuffer_height) = gop.current_mode_info().resolution();
+    let stride = gop.current_mode_info().stride();
+    //create framebuffer info struct
+    let framebuffer_info = FramebufferInfo {
+        framebuffer_addr,
+        framebuffer_size,
+        framebuffer_width,
+        framebuffer_height,
+        stride,
     };
-    let mut kernel_file = match kernel_handle.into_regular_file() {
-        Some(reg_file) => reg_file,
-        None => {
-            error!("Kernel is not a file");
-            loop {}
-        }
-    };
-    info!("Kernel Found");
-    //get kernel info, status 4 is buffer_too_small
-    //first run with a blank buffer to get the required size
-    let mut kernel_info_buffer: Vec<u8> = Vec::new();
-    let mut req_size = 0;
-    match kernel_file.get_info::<FileInfo>(&mut kernel_info_buffer) {
-        Ok(_) => (),
-        Err(err) if err.status() == Status::BUFFER_TOO_SMALL => req_size = err.data().unwrap(),
-        Err(why) => {
-            error!("{:?}", why);
-            loop {}
-        }
-    };
-    //set required size and try again
-    kernel_info_buffer.resize(req_size, 0);
-    let kernel_info = match kernel_file.get_info::<FileInfo>(&mut kernel_info_buffer) {
-        Ok(info) => info,
-        Err(why) => {
-            error!("2{:#?}", why);
-            loop {}
-        }
-    };
-    //get size of kernel and create buffer to read kernel into
-    let kernel_size = kernel_info.file_size();
-    let mut kernel_buffer: Vec<u8> = vec![0; kernel_size.try_into().unwrap()];
-    match kernel_file.read(&mut kernel_buffer) {
-        Ok(bytes_read) => info!("Read {} bytes from kernel", bytes_read),
-        Err(why) => {
-            error!("Failed to read kernel!:{:?}", why);
-            loop{}
-        }
-    }
-    //parse buffer with xmas elf
-    let kernel_elf = match ElfFile::new(&kernel_buffer) {
-        Ok(elf) => elf,
-        Err(why) => {
-            error!("{}", why);
-            loop{}
-        }
-    };
-    //get kernel entry point ptr
-    let entry_point = kernel_elf.header.pt2.entry_point();
-    //create a buffer to hold vecs of loaded section
-    //unsure if the destructor for the loaded sections will be called therefore adding them
-    //to this vec
-    let mut loaded_sections: Vec<Vec<u8>> = Vec::new();
-    //iterate over the program headers and load each header of type load
-    for header in kernel_elf.program_iter() {
-        if header.get_type().unwrap() == Type::Load {
-            let virt_addr = header.virtual_addr();
-            let file_size: usize = header.file_size().try_into().unwrap();
-            let mem_size = header.mem_size();
-            let file_offset: usize = header.offset().try_into().unwrap();
-            //align address on 4k boundary
-            let address = virt_addr - (virt_addr % 4096);
-            let mem_size_actual = (virt_addr - address) + mem_size;
-            //compute number of pages required
-            let num_pages: usize = ((mem_size_actual / 4096) + 1).try_into().unwrap();
-            //get ptr to system table for allocate pages call
-            let table = uefi_services::system_table().as_ptr();
-            unsafe {
-                let ptr = match BootServices::allocate_pages(
-                    (*table).boot_services(),
-                    AllocateType::Address(address.try_into().unwrap()),
-                    MemoryType(2),
-                    num_pages,
-                ) {
-                    Ok(addr) => addr,
-                    Err(why) => {
-                        error!("Failed to allocate pages:{:?}", why);
-                        loop {}
-                    }
-                };
-                //create a vec from allocated buffer and fill it with zeros
-                let mut buffer =
-                    Vec::from_raw_parts(ptr as *mut u8, num_pages * 4096, num_pages * 4096);
-                for byte in buffer.iter_mut() {
-                    *byte = 0;
-                }
-                //compute offset of the data with in the kernel buffer to be copied to memory
-                let offset: usize = (virt_addr - address).try_into().unwrap();
-                //start index for buffer
-                let mut start_index: usize = (offset).try_into().unwrap();
-                for byte in &kernel_buffer[file_offset..(file_offset + file_size)] {
-                    buffer[start_index] = *byte;
-                    start_index += 1;
-                }
-                //unsure if destructor will be called for our buffer when it goes out of scope,
-                // therefore push it to a vector outside of for loop
-                //global allocator's dealloc may be capable of deallocating our buffer
-                loaded_sections.push(buffer);
-            }
-        }
-    }
-    //our kernel's entry point's prototype
-    type KernelMain = fn(frame_buffer: &mut FrameBuffer, mem_map_buf: &mut [u8]) -> !;
-    let kernel_main: KernelMain;
-    unsafe {
-        kernel_main = core::mem::transmute(entry_point);
-    }
-    let gop = get_gop(&system_table).get();
+    //get kernel entry point
+    let kernel_entry_point = kernel_elf.header.pt2.entry_point() as usize;
+    writeln! {stdout,"Kernel entry point: {:#x}",kernel_entry_point}.unwrap();
+    //define kernel entry point type
+    type KernelMain = extern "efiapi" fn(
+        fb_info: FramebufferInfo,
+        system_table: SystemTable<Runtime>,
+        MemoryMap,
+    ) -> !;
+    //comvert kernel entry point into KernelMain
+    let kernel_entry_point = kernel_entry_point as *const ();
+    let kernel_main: KernelMain = unsafe { core::mem::transmute(kernel_entry_point) };
 
-    let framebuffer = FrameBuffer::new(gop);
-    let framebuffer = Box::leak(framebuffer);
-    info!("Calling kernel");
-    //get memory map size and create a buffer for memory map before calling exit boot services
-    let size = BootServices::memory_map_size(&system_table.boot_services());
-    let map_size = size.map_size;
-    let entry_size = size.entry_size;
-    let mut mem_map_buf: Vec<u8> = Vec::new();
-    mem_map_buf.resize(map_size + entry_size * 10, 0);
+    writeln! {stdout,"Calling kernel entry point"}.unwrap();
     //exit boot services
-    system_table.exit_boot_services(handle, &mut mem_map_buf);
-    kernel_main(framebuffer, &mut mem_map_buf);
-    //kernel never returns so we should never get here
-  
+    let (system_table_runtime, memory_map) =
+        system_table.exit_boot_services(MemoryType::LOADER_DATA);
+
+    kernel_main(framebuffer_info, system_table_runtime, memory_map);
 }
-//get graphics output protocol
-fn get_gop(sys: &SystemTable<Boot>) -> &UnsafeCell<GraphicsOutput> {
-    let gop = BootServices::locate_protocol::<GraphicsOutput>(sys.boot_services()).unwrap();
-    return gop;
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {}
 }
 
-struct FrameBuffer {
-    _base_address: *mut u8,
-    _size: usize,
-    _width: usize,
-    _height: usize,
-    _stride: usize,
+#[repr(C)]
+#[derive(Debug)]
+pub struct FramebufferInfo {
+    pub framebuffer_addr: *mut u8,
+    pub framebuffer_size: usize,
+    pub framebuffer_width: usize,
+    pub framebuffer_height: usize,
+    pub stride: usize,
 }
-
-impl FrameBuffer {
-    pub fn new(gop: *mut GraphicsOutput) -> Box<FrameBuffer> {
-        let base_address = unsafe { (*gop).frame_buffer().as_mut_ptr() };
-        let size = unsafe { (*gop).frame_buffer().size() };
-        let (width, height) = unsafe { (*gop).current_mode_info().resolution() };
-        let stride = unsafe { (*gop).current_mode_info().stride() };
-        let fb = FrameBuffer {
-            _base_address: base_address,
-            _size: size,
-            _width: width,
-            _height: height,
-            _stride: stride,
-        };
-
-        let fb_heap = Box::new(fb);
-        fb_heap
-    }
-}
+cl
