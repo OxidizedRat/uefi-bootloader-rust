@@ -266,4 +266,3 @@ pub struct FramebufferInfo {
     pub framebuffer_height: usize,
     pub stride: usize,
 }
-cl
