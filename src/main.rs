@@ -129,7 +129,6 @@ fn main(handle: Handle, system_table: SystemTable<Boot>) -> Status {
         writeln! {stdout,"Kernel is relocatable"}.unwrap();
         kernel_base_addr = 0x4000;
     }
-    writeln!(stdout, "got here").unwrap();
     //iterate over program headers and get headers of type load
     for ph in kernel_elf.program_iter() {
         if ph.get_type() == Ok(xmas_elf::program::Type::Load) {
@@ -218,7 +217,6 @@ fn main(handle: Handle, system_table: SystemTable<Boot>) -> Status {
     //get framebuffer address
     let framebuffer_addr = gop.frame_buffer().as_mut_ptr();
     let framebuffer_size = gop.frame_buffer().size();
-    writeln! {stdout,"Framebuffer size: {:?}",framebuffer_size}.unwrap();
     let (framebuffer_width, framebuffer_height) = gop.current_mode_info().resolution();
     let stride = gop.current_mode_info().stride();
     //create framebuffer info struct
@@ -288,9 +286,6 @@ fn load_segment(
     let num_pages = (segment_size + 0xfff) / 0x1000;
     //get aligned segment destination address
     let aligned_segment_dest_addr = segment_dest_addr - (segment_dest_addr % 4096);
-    writeln! {stdout,"Segment destination address: {:#x}",segment_dest_addr}.unwrap();
-    writeln! {stdout,"Aligned segment destination address: {:#x}",aligned_segment_dest_addr}
-        .unwrap();
     //allocate pages for segment
     match system_table.boot_services().allocate_pages(
         uefi::table::boot::AllocateType::Address(aligned_segment_dest_addr as u64),
