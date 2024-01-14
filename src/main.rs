@@ -16,14 +16,17 @@ use xmas_elf::program::ProgramHeader;
 use xmas_elf::ElfFile;
 mod relocation;
 use relocation::*;
-
+static mut STDOUT: u64 = 0x0;
 #[entry]
 fn main(handle: Handle, system_table: SystemTable<Boot>) -> Status {
     //get systemtable clone for use with console protocol
     let mut system_table_console = unsafe { system_table.unsafe_clone() };
     //get stdout for write macro
     let stdout = system_table_console.stdout();
-
+    unsafe {
+        let raw_pointer = stdout as *const Output as u64;
+        STDOUT = raw_pointer;
+    }
     //get systemtable ptr reference for use with fs protocol
     let system_table_fs = unsafe { system_table.unsafe_clone() };
     //get simple file system protocol
@@ -127,8 +130,10 @@ fn main(handle: Handle, system_table: SystemTable<Boot>) -> Status {
     //check if kernel is relocatable
     if kernel_elf.header.pt2.type_().as_type() == xmas_elf::header::Type::SharedObject {
         writeln! {stdout,"Kernel is relocatable"}.unwrap();
-        kernel_base_addr = 0x4000;
+        kernel_base_addr = 0x8000;
     }
+
+    writeln!(stdout, "Loading Kernel").unwrap();
     //iterate over program headers and get headers of type load
     for ph in kernel_elf.program_iter() {
         if ph.get_type() == Ok(xmas_elf::program::Type::Load) {
@@ -250,6 +255,9 @@ fn main(handle: Handle, system_table: SystemTable<Boot>) -> Status {
 }
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
+    let stdout_raw: *mut Output = unsafe { core::mem::transmute(STDOUT) };
+    let stdout = unsafe { &mut *stdout_raw };
+    writeln! {stdout,"panic: {:?}",_info}.unwrap();
     loop {}
 }
 
@@ -262,6 +270,7 @@ fn load_segment(
 ) {
     //get segment size
     let segment_size = ph.mem_size() as usize;
+    let segment_size_physcal = ph.file_size() as usize;
     //allocate pool for segment
     let segment_buffer_addr = match system_table
         .boot_services()
@@ -276,9 +285,10 @@ fn load_segment(
     //convert segment_buffer into slice
     let segment_offset = ph.offset() as usize;
     let segment_buffer =
-        unsafe { core::slice::from_raw_parts_mut(segment_buffer_addr, segment_size) };
+        unsafe { core::slice::from_raw_parts_mut(segment_buffer_addr, segment_size_physcal) };
     //copy segment into segment_buffer
-    segment_buffer.copy_from_slice(&kernel_buffer[segment_offset..segment_offset + segment_size]);
+    segment_buffer
+        .copy_from_slice(&kernel_buffer[segment_offset..segment_offset + segment_size_physcal]);
     //get segment destination address
     let mut segment_dest_addr = ph.physical_addr() as usize;
     segment_dest_addr += kernel_base_addr;
