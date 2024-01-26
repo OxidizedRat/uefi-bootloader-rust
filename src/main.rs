@@ -130,7 +130,7 @@ fn main(handle: Handle, system_table: SystemTable<Boot>) -> Status {
     //check if kernel is relocatable
     if kernel_elf.header.pt2.type_().as_type() == xmas_elf::header::Type::SharedObject {
         writeln! {stdout,"Kernel is relocatable"}.unwrap();
-        kernel_base_addr = 0x8000;
+        kernel_base_addr = 0x01000000;
     }
 
     writeln!(stdout, "Loading Kernel").unwrap();
