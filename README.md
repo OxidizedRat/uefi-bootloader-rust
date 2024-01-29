@@ -6,6 +6,7 @@ a UEFI bootloader written in rust for a personal project
 Loads an elf binary named "kernel" from the root directory of the efi partition and transfers control to it.
 ### How it does it ###
 *   Loads kernel into memory.
+*   Relocates kernel if necessary
 *   Gets GOP.
 *   Gets framebuffer information.
 *   exit boot services is called, which also gives us the memory map.
@@ -19,6 +20,6 @@ cargo build
 ## Expected Kernel Entry Point ##
 
 ```Rust
-  extern "efiapi" fn(fb_info:FramebufferInfo,system_table:SystemTable<Runtime>,memory_map:MemoryMap) -> ! 
+  extern "efiapi" fn(fb_info:FramebufferInfo,system_table:SystemTable<Runtime>,memory_map:&MemoryMap) -> ! 
 ```
 
